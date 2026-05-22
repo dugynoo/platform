@@ -732,11 +732,36 @@ function minmax (value = 0, min = 0, max = 0): number {
 }
 
 export function setLoadingState (view: EditorView, pos: number, loading: boolean): void {
+  console.debug('[setLoadingState] dispatch, pos:', pos, 'loading:', loading)
+
+  const doc = view.state.doc
+  const tr = view.state.tr
+
+  console.debug('[setLoadingState] pre-dispatch', {
+    pos,
+    loading,
+    docSize: doc.content.size,
+    docChildCount: doc.childCount,
+    docJSON: doc.toJSON(),
+    plugins: view.state.plugins.map((p: any) => p.key),
+    trSteps: tr.steps.length
+  })
+
   const meta: LoadingStateTxMeta = {
     setLoading: { pos, loading }
   }
 
-  view.dispatch(view.state.tr.setMeta(loadingStatePluginKey, meta).setMeta('loadingState', loading))
+  try {
+    view.dispatch(tr.setMeta(loadingStatePluginKey, meta).setMeta('loadingState', loading))
+  } catch (err) {
+    console.error('[setLoadingState] dispatch crashed', {
+      error: err,
+      pos,
+      loading,
+      docJSON: doc.toJSON()
+    })
+    throw err
+  }
 }
 
 export const GeneralToolbarProvider: ToolbarProvider<any> = {

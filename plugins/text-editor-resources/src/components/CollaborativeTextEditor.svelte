@@ -446,7 +446,11 @@
       onCreate: () => {
         editorReady = true
       },
-      onTransaction: () => {
+      onTransaction: ({ transaction }) => {
+        const loadingMeta = transaction.getMeta('loadingState')
+        if (loadingMeta !== undefined) {
+          console.debug('[CollabEditor] onTransaction with loadingState meta:', loadingMeta)
+        }
         // force re-render so `editor.isActive` works as expected
         editor = editor
       },
