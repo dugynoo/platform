@@ -200,18 +200,15 @@ async function onSetForum (ctx: Context, worker: PlatformWorker): Promise<void> 
   }
 
   if (isDm) {
-    try {
-      const probe = await ctx.telegram.createForumTopic(chatId, '__huly_probe__')
-      try {
-        await ctx.telegram.deleteForumTopic(chatId, probe.message_thread_id)
-      } catch (e) {
-        // cleanup best-effort; the topic may stay visible briefly but won't cause harm
-      }
-    } catch (e) {
+    // Cheaper than probing with createForumTopic+deleteForumTopic — getMe() exposes the
+    // Threaded Mode bit added in Bot API 9.4 via the has_topics_enabled field. Probe path
+    // also pollutes the chat history with a service message even after the topic is deleted.
+    const me = await ctx.telegram.getMe() as { username?: string, has_topics_enabled?: boolean }
+    if (me.has_topics_enabled !== true) {
       await ctx.reply(
-        'Topic creation is not allowed in this DM. The bot administrator must enable "Threaded Mode" via @BotFather → /mybots → @' +
-          (await ctx.telegram.getMe()).username +
-          ' → Bot Settings → Threads Settings, then retry /setforum.'
+        'Topic creation is not allowed in this DM. The bot administrator must enable Threaded Mode via @BotFather → /mybots → @' +
+          (me.username ?? 'bot') +
+          ' → press Open (Mini App) → Threads → toggle ON, then retry /setforum.'
       )
       return
     }

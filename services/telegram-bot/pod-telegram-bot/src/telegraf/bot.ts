@@ -306,12 +306,31 @@ export async function setUpBot (worker: PlatformWorker): Promise<Telegraf<TgCont
     if (chatId === undefined) return
     if ('reply_to_message' in ctx.message) return
 
+    // Skip Telegram forum service messages (topic created/edited/closed/reopened, etc.).
+    // They carry message_thread_id but represent system events, not user input — answering
+    // them with reply_parameters tied to a transient probe topic causes 400 "message thread not found".
+    const m = ctx.message as Record<string, unknown>
+    if (
+      m.forum_topic_created !== undefined ||
+      m.forum_topic_edited !== undefined ||
+      m.forum_topic_closed !== undefined ||
+      m.forum_topic_reopened !== undefined ||
+      m.general_forum_topic_hidden !== undefined ||
+      m.general_forum_topic_unhidden !== undefined
+    ) {
+      return
+    }
+
     const fromId = ctx.from?.id
     const threadId = (ctx.message as Message.TextMessage & { message_thread_id?: number }).message_thread_id
 
     if (fromId !== undefined && threadId !== undefined && (ctx.chat?.type === 'supergroup' || ctx.chat?.type === 'private')) {
       const routed = await handleForumTopicMessage(ctx, worker, chatId, threadId, fromId)
       if (routed) return
+      // We are inside a topic but cannot map it to a Huly channel — skip the legacy
+      // workspace/channel keyboard fallback, otherwise Telegraf will reply with
+      // the same message_thread_id which may no longer exist (e.g. probe topic, stale topic).
+      return
     }
 
     const integrations = await listIntegrationsByTelegramId(chatId)
