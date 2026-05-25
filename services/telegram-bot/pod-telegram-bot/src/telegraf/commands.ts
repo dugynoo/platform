@@ -25,7 +25,8 @@ import {
   listIntegrationsByTelegramId,
   getAccountPerson,
   removeIntegrationsByTg,
-  getAnyIntegrationByTelegramId
+  getAnyIntegrationByTelegramId,
+  updateIntegrationData
 } from '../account'
 import { WorkspaceUuid } from '@hcengineering/core'
 
@@ -34,6 +35,8 @@ export enum Command {
   Connect = 'connect',
   SyncAllChannels = 'sync_all_channels',
   SyncStarredChannels = 'sync_starred_channels',
+  SetForum = 'setforum',
+  UnsetForum = 'unsetforum',
   Help = 'help',
   Stop = 'stop'
 }
@@ -55,6 +58,14 @@ export async function getBotCommands (lang: string = 'en'): Promise<BotCommand[]
     {
       command: Command.SyncStarredChannels,
       description: await translate(telegram.string.SyncStarredChannels, { app: config.App }, lang)
+    },
+    {
+      command: Command.SetForum,
+      description: 'Route notifications into a Telegram forum supergroup (one topic per channel)'
+    },
+    {
+      command: Command.UnsetForum,
+      description: 'Disable forum routing and send notifications back to this DM'
     },
     {
       command: Command.Help,
@@ -142,6 +153,80 @@ async function onSyncChannels (ctx: Context, worker: PlatformWorker, onlyStarred
   await ctx.reply('List of channels updated')
 }
 
+async function onSetForum (ctx: Context, worker: PlatformWorker): Promise<void> {
+  const id = ctx.from?.id
+  if (id === undefined) return
+
+  const text = ctx.message !== undefined && 'text' in ctx.message ? ctx.message.text : ''
+  const arg = text.split(/\s+/).slice(1).join(' ').trim()
+
+  if (arg === '') {
+    await ctx.reply(
+      'Usage: /setforum <chatId>\n\n' +
+        '1. Create a Telegram supergroup and enable Topics in its settings.\n' +
+        '2. Add me as administrator with "Manage Topics" permission.\n' +
+        '3. Run /setforum -100xxxxxxxxxx with the supergroup chat id.\n\n' +
+        'From then on every Huly channel becomes a dedicated topic in that supergroup.'
+    )
+    return
+  }
+
+  const chatId = Number(arg)
+  if (!Number.isFinite(chatId) || Number.isNaN(chatId)) {
+    await ctx.reply('Invalid chat id. Expected a negative integer like -1001234567890.')
+    return
+  }
+
+  let chat: Awaited<ReturnType<typeof ctx.telegram.getChat>>
+  try {
+    chat = await ctx.telegram.getChat(chatId)
+  } catch (e) {
+    await ctx.reply(
+      'I cannot access that chat. Make sure the supergroup exists and that I have been added as administrator.'
+    )
+    return
+  }
+
+  if (chat.type !== 'supergroup' || !('is_forum' in chat) || chat.is_forum !== true) {
+    await ctx.reply(
+      'That chat is not a forum supergroup. Open the group settings and enable "Topics" first.'
+    )
+    return
+  }
+
+  const integrations = await listIntegrationsByTelegramId(id)
+  if (integrations.length === 0) {
+    await ctx.reply('No Huly integration found. Connect a workspace first via /connect.')
+    return
+  }
+
+  for (const integration of integrations) {
+    await updateIntegrationData(integration, { forumChatId: chatId })
+  }
+
+  await ctx.reply(
+    `Forum routing enabled. Topics will be created in <b>${'title' in chat ? chat.title : chatId}</b>.`,
+    { parse_mode: 'HTML' }
+  )
+}
+
+async function onUnsetForum (ctx: Context, worker: PlatformWorker): Promise<void> {
+  const id = ctx.from?.id
+  if (id === undefined) return
+
+  const integrations = await listIntegrationsByTelegramId(id)
+  if (integrations.length === 0) {
+    await ctx.reply('No Huly integration found.')
+    return
+  }
+
+  for (const integration of integrations) {
+    await updateIntegrationData(integration, { forumChatId: null })
+  }
+
+  await ctx.reply('Forum routing disabled. Notifications will return to this DM.')
+}
+
 async function onConnect (ctx: Context, worker: PlatformWorker): Promise<void> {
   const id = ctx.from?.id
   const lang = ctx.from?.language_code ?? 'en'
@@ -178,4 +263,6 @@ export async function defineCommands (bot: Telegraf<TgContext>, worker: Platform
   bot.command(Command.Connect, (ctx) => onConnect(ctx, worker))
   bot.command(Command.SyncAllChannels, (ctx) => onSyncChannels(ctx, worker, false))
   bot.command(Command.SyncStarredChannels, (ctx) => onSyncChannels(ctx, worker, true))
+  bot.command(Command.SetForum, (ctx) => onSetForum(ctx, worker))
+  bot.command(Command.UnsetForum, (ctx) => onUnsetForum(ctx, worker))
 }
