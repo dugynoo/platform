@@ -158,23 +158,23 @@ async function onSetForum (ctx: Context, worker: PlatformWorker): Promise<void> 
   if (id === undefined) return
 
   const text = ctx.message !== undefined && 'text' in ctx.message ? ctx.message.text : ''
-  const arg = text.split(/\s+/).slice(1).join(' ').trim()
+  const arg = text.split(/\s+/).slice(1).join(' ').trim().toLowerCase()
+  const wantsDm = arg === '' || arg === 'dm' || arg === 'here' || arg === 'me'
 
-  if (arg === '') {
-    await ctx.reply(
-      'Usage: /setforum <chatId>\n\n' +
-        '1. Create a Telegram supergroup and enable Topics in its settings.\n' +
-        '2. Add me as administrator with "Manage Topics" permission.\n' +
-        '3. Run /setforum -100xxxxxxxxxx with the supergroup chat id.\n\n' +
-        'From then on every Huly channel becomes a dedicated topic in that supergroup.'
-    )
-    return
-  }
-
-  const chatId = Number(arg)
-  if (!Number.isFinite(chatId) || Number.isNaN(chatId)) {
-    await ctx.reply('Invalid chat id. Expected a negative integer like -1001234567890.')
-    return
+  let chatId: number
+  if (wantsDm) {
+    chatId = id
+  } else {
+    chatId = Number(arg)
+    if (!Number.isFinite(chatId) || Number.isNaN(chatId)) {
+      await ctx.reply(
+        'Usage: /setforum                    — create topics here in our DM (recommended)\n' +
+          '       /setforum -100xxxxxxxx     — create topics in that forum supergroup\n\n' +
+          'DM mode requires Threaded Mode enabled on me via @BotFather. ' +
+          'Supergroup mode requires me to be admin with Manage Topics permission.'
+      )
+      return
+    }
   }
 
   let chat: Awaited<ReturnType<typeof ctx.telegram.getChat>>
@@ -182,16 +182,39 @@ async function onSetForum (ctx: Context, worker: PlatformWorker): Promise<void> 
     chat = await ctx.telegram.getChat(chatId)
   } catch (e) {
     await ctx.reply(
-      'I cannot access that chat. Make sure the supergroup exists and that I have been added as administrator.'
+      wantsDm
+        ? 'Internal error: cannot resolve this DM chat. Please /start me first, then retry.'
+        : 'I cannot access that chat. Make sure the supergroup exists and that I have been added as administrator.'
     )
     return
   }
 
-  if (chat.type !== 'supergroup' || !('is_forum' in chat) || chat.is_forum !== true) {
+  const isDm = chat.type === 'private'
+  const isForumSupergroup = chat.type === 'supergroup' && 'is_forum' in chat && chat.is_forum === true
+
+  if (!isDm && !isForumSupergroup) {
     await ctx.reply(
-      'That chat is not a forum supergroup. Open the group settings and enable "Topics" first.'
+      'That chat is not a forum supergroup or our private DM. Open the group settings and enable "Topics" first, or just run /setforum with no arguments to use this DM.'
     )
     return
+  }
+
+  if (isDm) {
+    try {
+      const probe = await ctx.telegram.createForumTopic(chatId, '__huly_probe__')
+      try {
+        await ctx.telegram.deleteForumTopic(chatId, probe.message_thread_id)
+      } catch (e) {
+        // cleanup best-effort; the topic may stay visible briefly but won't cause harm
+      }
+    } catch (e) {
+      await ctx.reply(
+        'Topic creation is not allowed in this DM. The bot administrator must enable "Threaded Mode" via @BotFather → /mybots → @' +
+          (await ctx.telegram.getMe()).username +
+          ' → Bot Settings → Threads Settings, then retry /setforum.'
+      )
+      return
+    }
   }
 
   const integrations = await listIntegrationsByTelegramId(id)
@@ -204,8 +227,10 @@ async function onSetForum (ctx: Context, worker: PlatformWorker): Promise<void> 
     await updateIntegrationData(integration, { forumChatId: chatId })
   }
 
+  const where = isDm ? 'this DM' : `<b>${'title' in chat ? chat.title : chatId}</b>`
   await ctx.reply(
-    `Forum routing enabled. Topics will be created in <b>${'title' in chat ? chat.title : chatId}</b>.`,
+    `Forum routing enabled. Every Huly channel will become its own topic in ${where}. ` +
+      'Use /unsetforum to turn it off.',
     { parse_mode: 'HTML' }
   )
 }

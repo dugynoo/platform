@@ -276,7 +276,7 @@ export async function setUpBot (worker: PlatformWorker): Promise<Telegraf<TgCont
     // In a forum supergroup, a "reply" to the topic's first system message is not really
     // a reply to a notification — it is the user opening the topic. Treat it as a fresh
     // forum-routed message instead of trying to thread-link it.
-    if (fromId !== undefined && threadId !== undefined && ctx.chat?.type === 'supergroup') {
+    if (fromId !== undefined && threadId !== undefined && (ctx.chat?.type === 'supergroup' || ctx.chat?.type === 'private')) {
       const replyToId = message.reply_to_message.message_id
       const isTopicHead = replyToId === threadId
       if (isTopicHead) {
@@ -309,7 +309,7 @@ export async function setUpBot (worker: PlatformWorker): Promise<Telegraf<TgCont
     const fromId = ctx.from?.id
     const threadId = (ctx.message as Message.TextMessage & { message_thread_id?: number }).message_thread_id
 
-    if (fromId !== undefined && threadId !== undefined && ctx.chat?.type === 'supergroup') {
+    if (fromId !== undefined && threadId !== undefined && (ctx.chat?.type === 'supergroup' || ctx.chat?.type === 'private')) {
       const routed = await handleForumTopicMessage(ctx, worker, chatId, threadId, fromId)
       if (routed) return
     }
