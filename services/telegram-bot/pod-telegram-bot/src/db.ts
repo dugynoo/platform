@@ -14,12 +14,19 @@
 //
 
 import postgres from 'postgres'
-import { AccountUuid, Ref, WorkspaceUuid } from '@hcengineering/core'
-import { ChunterSpace } from '@hcengineering/chunter'
+import { AccountUuid, Ref, Space, WorkspaceUuid } from '@hcengineering/core'
 import { ActivityMessage } from '@hcengineering/activity'
 
 import config from './config'
-import { ChannelId, ChannelRecord, ForumTopicRecord, MessageRecord, OtpRecord, ReplyRecord } from './types'
+import {
+  ChannelId,
+  ChannelRecord,
+  ForumTopicKind,
+  ForumTopicRecord,
+  MessageRecord,
+  OtpRecord,
+  ReplyRecord
+} from './types'
 
 export async function getDb (): Promise<PostgresDB> {
   const sql = postgres(config.DbUrl, {
@@ -38,6 +45,7 @@ const messagesTable = 'telegram_bot.messages'
 const channelsTable = 'telegram_bot.channels'
 const repliesTable = 'telegram_bot.replies'
 const forumTopicsTable = 'telegram_bot.forum_topics'
+const forumTopicsCleanupTable = 'telegram_bot.forum_topics_cleanup'
 
 type DBFlavor = 'cockroach' | 'postgres' | 'unknown'
 
@@ -117,13 +125,79 @@ export class PostgresDB {
           channel_id VARCHAR(255) NOT NULL,
           forum_chat_id INT8 NOT NULL,
           topic_id INT8 NOT NULL,
+          kind TEXT NOT NULL DEFAULT 'chunter',
           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          PRIMARY KEY (workspace, account, channel_id),
+          PRIMARY KEY (workspace, forum_chat_id, channel_id),
           UNIQUE (forum_chat_id, topic_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS ${forumTopicsCleanupTable} (
+          forum_chat_id INT8 NOT NULL,
+          topic_id INT8 NOT NULL,
+          enqueued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (forum_chat_id, topic_id)
         );
   `
 
     await client.unsafe(sql)
+    await this.migrateForumTopicsV4(client)
+  }
+
+  /**
+   * v4 migration: forum_topics PK changes from (workspace, account, channel_id) to
+   * (workspace, forum_chat_id, channel_id) so multiple users sharing a supergroup
+   * reuse the same topic per Huly channel. Also adds the `kind` column.
+   *
+   * Idempotent: detects old PK shape via information_schema and skips if migrated.
+   * Duplicate topic_ids encountered during dedup are enqueued into the cleanup table
+   * so the worker can delete them from Telegram after startup.
+   */
+  private static async migrateForumTopicsV4 (client: postgres.Sql): Promise<void> {
+    const kindCol = await client.unsafe(
+      `SELECT 1 FROM information_schema.columns
+       WHERE table_schema = 'telegram_bot' AND table_name = 'forum_topics' AND column_name = 'kind'`
+    )
+
+    const pkAccount = await client.unsafe(
+      `SELECT 1 FROM information_schema.key_column_usage
+       WHERE table_schema = 'telegram_bot' AND table_name = 'forum_topics'
+         AND constraint_name LIKE '%pkey%' AND column_name = 'account'`
+    )
+
+    if (kindCol.length > 0 && pkAccount.length === 0) return
+
+    if (kindCol.length === 0) {
+      await client.unsafe(
+        `ALTER TABLE ${forumTopicsTable} ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'chunter'`
+      )
+    }
+
+    if (pkAccount.length > 0) {
+      await client.unsafe(
+        `INSERT INTO ${forumTopicsCleanupTable} (forum_chat_id, topic_id)
+         SELECT t1.forum_chat_id, t1.topic_id FROM ${forumTopicsTable} t1
+         WHERE EXISTS (
+           SELECT 1 FROM ${forumTopicsTable} t2
+           WHERE t2.created_at < t1.created_at
+             AND t2.workspace = t1.workspace
+             AND t2.forum_chat_id = t1.forum_chat_id
+             AND t2.channel_id = t1.channel_id
+         )
+         ON CONFLICT DO NOTHING`
+      )
+
+      await client.unsafe(
+        `DELETE FROM ${forumTopicsTable} t1 USING ${forumTopicsTable} t2
+         WHERE t1.created_at > t2.created_at
+           AND t1.workspace = t2.workspace
+           AND t1.forum_chat_id = t2.forum_chat_id
+           AND t1.channel_id = t2.channel_id`
+      )
+
+      await client.unsafe(
+        `ALTER TABLE ${forumTopicsTable} ALTER PRIMARY KEY USING COLUMNS (workspace, forum_chat_id, channel_id)`
+      )
+    }
   }
 
   async insertOtp (otp: OtpRecord): Promise<void> {
@@ -232,30 +306,31 @@ export class PostgresDB {
 
   async getForumTopic (
     workspace: WorkspaceUuid,
-    account: AccountUuid,
-    channelId: Ref<ChunterSpace>
+    forumChatId: number,
+    channelId: Ref<Space>
   ): Promise<ForumTopicRecord | undefined> {
     const sql = `
       SELECT * FROM ${forumTopicsTable}
-      WHERE workspace = $1::uuid AND account = $2::uuid AND channel_id = $3::varchar
+      WHERE workspace = $1::uuid AND forum_chat_id = $2::int8 AND channel_id = $3::varchar
       LIMIT 1`
-    const res = await this.client.unsafe(sql, [workspace, account, channelId])
+    const res = await this.client.unsafe(sql, [workspace, forumChatId, channelId])
     return res.map(toForumTopicRecord)[0]
   }
 
   async insertForumTopic (record: Omit<ForumTopicRecord, 'createdAt'>): Promise<void> {
     const sql = `
       INSERT INTO ${forumTopicsTable} (
-        workspace, account, channel_id, forum_chat_id, topic_id
+        workspace, account, channel_id, forum_chat_id, topic_id, kind
       )
-      VALUES ($1::uuid, $2::uuid, $3::varchar, $4::int8, $5::int8)
-      ON CONFLICT (workspace, account, channel_id) DO NOTHING`
+      VALUES ($1::uuid, $2::uuid, $3::varchar, $4::int8, $5::int8, $6::text)
+      ON CONFLICT (workspace, forum_chat_id, channel_id) DO NOTHING`
     await this.client.unsafe(sql, [
       record.workspace,
       record.account,
       record.channelId,
       record.forumChatId,
-      record.topicId
+      record.topicId,
+      record.kind
     ])
   }
 
@@ -266,6 +341,43 @@ export class PostgresDB {
       LIMIT 1`
     const res = await this.client.unsafe(sql, [forumChatId, topicId])
     return res.map(toForumTopicRecord)[0]
+  }
+
+  async listAllForumTopics (): Promise<ForumTopicRecord[]> {
+    const res = await this.client.unsafe(`SELECT * FROM ${forumTopicsTable}`)
+    return res.map(toForumTopicRecord)
+  }
+
+  async deleteForumTopic (
+    workspace: WorkspaceUuid,
+    forumChatId: number,
+    channelId: Ref<Space>
+  ): Promise<void> {
+    const sql = `
+      DELETE FROM ${forumTopicsTable}
+      WHERE workspace = $1::uuid AND forum_chat_id = $2::int8 AND channel_id = $3::varchar`
+    await this.client.unsafe(sql, [workspace, forumChatId, channelId])
+  }
+
+  async getCleanupPending (): Promise<Array<{ forumChatId: number, topicId: number }>> {
+    const res = await this.client.unsafe(
+      `SELECT forum_chat_id, topic_id FROM ${forumTopicsCleanupTable} ORDER BY enqueued_at ASC LIMIT 500`
+    )
+    return res.map((r: any) => ({ forumChatId: Number(r.forum_chat_id), topicId: Number(r.topic_id) }))
+  }
+
+  async removeCleanupPending (forumChatId: number, topicId: number): Promise<void> {
+    await this.client.unsafe(
+      `DELETE FROM ${forumTopicsCleanupTable} WHERE forum_chat_id = $1::int8 AND topic_id = $2::int8`,
+      [forumChatId, topicId]
+    )
+  }
+
+  async enqueueCleanup (forumChatId: number, topicId: number): Promise<void> {
+    await this.client.unsafe(
+      `INSERT INTO ${forumTopicsCleanupTable} (forum_chat_id, topic_id) VALUES ($1::int8, $2::int8) ON CONFLICT DO NOTHING`,
+      [forumChatId, topicId]
+    )
   }
 
   async close (): Promise<void> {
@@ -318,6 +430,7 @@ function toForumTopicRecord (raw: any): ForumTopicRecord {
     channelId: raw.channel_id,
     forumChatId: Number(raw.forum_chat_id),
     topicId: Number(raw.topic_id),
+    kind: ((raw.kind as ForumTopicKind | undefined) ?? 'chunter'),
     createdAt: new Date(raw.created_at)
   }
 }

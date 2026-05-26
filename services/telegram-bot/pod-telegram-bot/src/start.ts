@@ -76,6 +76,12 @@ export const start = async (): Promise<void> => {
     })
   }
 
+  setTimeout(() => {
+    void worker.cleanupStaleForumTopics(bot).catch((e) => {
+      ctx.warn('Forum topic cleanup failed', { error: e })
+    })
+  }, 5000)
+
   app.get(`/telegraf/${bot.secretPathComponent()}`, (req, res) => {
     res.status(200).send()
   })

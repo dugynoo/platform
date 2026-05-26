@@ -13,10 +13,18 @@
 // limitations under the License.
 //
 
-import { AccountUuid, Class, Ref, WorkspaceUuid } from '@hcengineering/core'
+import { AccountUuid, Class, Ref, Space, WorkspaceUuid } from '@hcengineering/core'
 import { ChunterSpace } from '@hcengineering/chunter'
 import { ActivityMessage } from '@hcengineering/activity'
 import { Integration } from '@hcengineering/account-client'
+
+export type ForumTopicKind = 'chunter' | 'tracker'
+
+export interface RoutingTarget {
+  spaceRef: Ref<Space>
+  spaceName: string
+  kind: ForumTopicKind
+}
 
 export type ChannelId = string & { __channelId: true }
 
@@ -45,9 +53,10 @@ export interface ReplyRecord {
 export interface ForumTopicRecord {
   workspace: WorkspaceUuid
   account: AccountUuid
-  channelId: Ref<ChunterSpace>
+  channelId: Ref<Space>
   forumChatId: number
   topicId: number
+  kind: ForumTopicKind
   createdAt: Date
 }
 

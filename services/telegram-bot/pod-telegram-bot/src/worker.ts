@@ -13,7 +13,7 @@
 // limitations under the License.
 //
 
-import { AccountUuid, MeasureContext, PersonId, Ref, WorkspaceUuid } from '@hcengineering/core'
+import { AccountUuid, MeasureContext, PersonId, Ref, Space, WorkspaceUuid } from '@hcengineering/core'
 import { StorageAdapter, type StorageConfiguration } from '@hcengineering/server-core'
 import chunter, { ChunterSpace } from '@hcengineering/chunter'
 import { formatName } from '@hcengineering/contact'
@@ -23,11 +23,13 @@ import { ActivityMessage } from '@hcengineering/activity'
 import {
   ChannelId,
   ChannelRecord,
+  ForumTopicKind,
   ForumTopicRecord,
   IntegrationInfo,
   MessageRecord,
   PlatformFileInfo,
   ReplyRecord,
+  RoutingTarget,
   TelegramFileInfo,
   WorkspaceInfo
 } from './types'
@@ -144,24 +146,21 @@ export class PlatformWorker {
     return await wsClient.getFiles(message)
   }
 
-  async getChannelInfoForMessage (
+  async getRoutingTargetForMessage (
     workspace: WorkspaceUuid,
     account: AccountUuid,
     messageId: Ref<ActivityMessage>
-  ): Promise<{ channelId: Ref<ChunterSpace>, channelName: string } | undefined> {
+  ): Promise<RoutingTarget | undefined> {
     const wsClient = await WorkspaceClient.create(workspace, account, this.ctx, this.storage)
-    const channel = await wsClient.getChannelForActivityMessage(messageId)
-    if (channel === undefined) return undefined
-    const channelName = await this.getChannelName(wsClient, channel, account)
-    return { channelId: channel._id, channelName }
+    return await wsClient.getRoutingTarget(messageId, account)
   }
 
   async getForumTopic (
     workspace: WorkspaceUuid,
-    account: AccountUuid,
-    channelId: Ref<ChunterSpace>
+    forumChatId: number,
+    channelId: Ref<Space>
   ): Promise<ForumTopicRecord | undefined> {
-    return await this.db.getForumTopic(workspace, account, channelId)
+    return await this.db.getForumTopic(workspace, forumChatId, channelId)
   }
 
   async saveForumTopic (record: Omit<ForumTopicRecord, 'createdAt'>): Promise<void> {
@@ -206,19 +205,7 @@ export class PlatformWorker {
   }
 
   async getChannelName (client: WorkspaceClient, channel: ChunterSpace, account: AccountUuid): Promise<string> {
-    if (client.hierarchy.isDerived(channel._class, chunter.class.DirectMessage)) {
-      const persons = await client.getPersons(channel.members.filter((it) => it !== account))
-      return persons
-        .map(({ name }) => formatName(name))
-        .sort((a, b) => a.localeCompare(b))
-        .join(', ')
-    }
-
-    if (client.hierarchy.isDerived(channel._class, chunter.class.Channel)) {
-      return `#${channel.name}`
-    }
-
-    return channel.name
+    return await client.formatChunterName(channel, account)
   }
 
   async getChannels (account: AccountUuid, workspace: WorkspaceUuid): Promise<ChannelRecord[]> {
@@ -453,7 +440,7 @@ export class PlatformWorker {
         )
         if (routed !== undefined) {
           targetChatId = forumChatId
-          threadId = routed
+          threadId = routed.threadId
         }
       }
 
@@ -501,9 +488,11 @@ export class PlatformWorker {
   }
 
   /**
-   * Looks up (or lazily creates) the Telegram forum topic that mirrors the Huly channel
-   * that owns this activity message. Returns the topic message_thread_id, or undefined
-   * if the channel cannot be resolved or topic creation fails.
+   * Looks up (or lazily creates) the Telegram forum topic that mirrors the Huly source
+   * (chat channel or Tracker project) for this activity message. Uses a per-chat key
+   * so multiple users sharing a supergroup reuse the same topic per source.
+   * Returns the topic message_thread_id and its kind, or undefined when routing
+   * is not possible (unknown source, deleted parent, Telegram error).
    */
   async resolveForumTopic (
     bot: Telegraf<TgContext>,
@@ -511,36 +500,92 @@ export class PlatformWorker {
     workspace: WorkspaceUuid,
     account: AccountUuid,
     messageId: Ref<ActivityMessage>
-  ): Promise<number | undefined> {
-    let channelInfo: { channelId: Ref<ChunterSpace>, channelName: string } | undefined
+  ): Promise<{ threadId: number, kind: ForumTopicKind } | undefined> {
+    let target: RoutingTarget | undefined
     try {
-      channelInfo = await this.getChannelInfoForMessage(workspace, account, messageId)
+      target = await this.getRoutingTargetForMessage(workspace, account, messageId)
     } catch (e) {
-      this.ctx.warn('Failed to resolve channel for forum topic', { error: e, messageId })
+      this.ctx.warn('Failed to resolve routing target for forum topic', { error: e, messageId })
       return undefined
     }
-    if (channelInfo === undefined) return undefined
+    if (target === undefined) return undefined
 
-    const existing = await this.db.getForumTopic(workspace, account, channelInfo.channelId)
-    if (existing !== undefined) return existing.topicId
+    const existing = await this.db.getForumTopic(workspace, forumChatId, target.spaceRef)
+    if (existing !== undefined) return { threadId: existing.topicId, kind: existing.kind }
 
     try {
-      const created = await bot.telegram.createForumTopic(forumChatId, channelInfo.channelName)
+      const iconColor = target.kind === 'tracker' ? 0x6FB9F0 : 0x7ABA3C
+      const created = await bot.telegram.createForumTopic(forumChatId, target.spaceName, {
+        icon_color: iconColor
+      } as any)
       await this.db.insertForumTopic({
         workspace,
         account,
-        channelId: channelInfo.channelId,
+        channelId: target.spaceRef,
         forumChatId,
-        topicId: created.message_thread_id
+        topicId: created.message_thread_id,
+        kind: target.kind
       })
-      return created.message_thread_id
+      return { threadId: created.message_thread_id, kind: target.kind }
     } catch (e) {
       this.ctx.warn('Failed to create forum topic, falling back to DM', {
         error: e,
         forumChatId,
-        channelName: channelInfo.channelName
+        topicName: target.spaceName,
+        kind: target.kind
       })
       return undefined
+    }
+  }
+
+  /**
+   * Deletes forum_topics rows whose forum_chat_id no longer matches the user's current
+   * /setforum target (the user moved routing to another chat) and asks Telegram to delete
+   * the orphan topic. Also drains entries enqueued during the v4 PK migration. Runs once
+   * after the bot has launched. Best-effort: per-topic failures are logged and skipped.
+   */
+  async cleanupStaleForumTopics (bot: Telegraf<TgContext>): Promise<void> {
+    const RATE_DELAY_MS = 50
+
+    const pending = await this.db.getCleanupPending()
+    for (const { forumChatId, topicId } of pending) {
+      try {
+        await bot.telegram.deleteForumTopic(forumChatId, topicId)
+      } catch (e) {
+        this.ctx.warn('Failed to delete migration-orphan topic', { error: e, forumChatId, topicId })
+      }
+      await this.db.removeCleanupPending(forumChatId, topicId)
+      await new Promise((r) => setTimeout(r, RATE_DELAY_MS))
+    }
+
+    const rows = await this.db.listAllForumTopics()
+    const currentByAccount = new Map<AccountUuid, number | undefined>()
+    let cleaned = 0
+    for (const row of rows) {
+      let current = currentByAccount.get(row.account)
+      if (!currentByAccount.has(row.account)) {
+        const integrations = await listIntegrationsByAccount(row.account)
+        current = this.getForumChatId(integrations)
+        currentByAccount.set(row.account, current)
+      }
+      if (current !== undefined && current === row.forumChatId) continue
+
+      try {
+        await bot.telegram.deleteForumTopic(row.forumChatId, row.topicId)
+      } catch (e) {
+        this.ctx.warn('Failed to delete stale forum topic', {
+          error: e,
+          forumChatId: row.forumChatId,
+          topicId: row.topicId
+        })
+      }
+      await this.db.deleteForumTopic(row.workspace, row.forumChatId, row.channelId)
+      cleaned++
+      await new Promise((r) => setTimeout(r, RATE_DELAY_MS))
+    }
+
+    if (cleaned > 0 || pending.length > 0) {
+      this.ctx.info('Forum topic cleanup complete', { stale: cleaned, migrationOrphans: pending.length })
     }
   }
 

@@ -20,7 +20,8 @@ import { htmlToMarkup, isEmptyMarkup, jsonToMarkup, MarkupNodeType } from '@hcen
 import { toHTML } from '@telegraf/entity'
 import { CallbackQuery, Message, Update } from 'telegraf/typings/core/types/typegram'
 import { translate } from '@hcengineering/platform'
-import { AccountUuid, WorkspaceUuid } from '@hcengineering/core'
+import { AccountUuid, Ref, WorkspaceUuid } from '@hcengineering/core'
+import { ChunterSpace } from '@hcengineering/chunter'
 
 import config from '../config'
 import { PlatformWorker } from '../worker'
@@ -115,10 +116,15 @@ async function handleForumTopicMessage (
   const topic = await worker.getForumTopicByThread(chatId, threadId)
   if (topic === undefined) return false
 
+  // Tracker topics mirror Issue notifications but a top-level Telegram post has no Issue
+  // context to attach to. Silently consume the event so the bot does not fall back to the
+  // workspace/channel keyboard inside the topic.
+  if (topic.kind === 'tracker') return true
+
   const integration = await getAnyIntegrationByTelegramId(fromId, topic.workspace)
   if (integration === undefined) return false
 
-  const channel = await worker.resolveChannelByRef(topic.workspace, topic.account, topic.channelId)
+  const channel = await worker.resolveChannelByRef(topic.workspace, topic.account, topic.channelId as Ref<ChunterSpace>)
   if (channel === undefined) return false
 
   const ctxMessage = ctx.message as Message | undefined

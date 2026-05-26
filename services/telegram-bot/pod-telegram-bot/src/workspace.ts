@@ -29,7 +29,7 @@ import core, {
 } from '@hcengineering/core'
 import notification from '@hcengineering/notification'
 import chunter, { ChatMessage, ChunterSpace, ThreadMessage } from '@hcengineering/chunter'
-import contact, { Person } from '@hcengineering/contact'
+import contact, { formatName, Person } from '@hcengineering/contact'
 import { getTransactorEndpoint } from '@hcengineering/server-client'
 import activity, { ActivityMessage } from '@hcengineering/activity'
 import attachment, { Attachment } from '@hcengineering/attachment'
@@ -37,8 +37,9 @@ import { StorageAdapter } from '@hcengineering/server-core'
 import { createRestClient, RestClient } from '@hcengineering/api-client'
 import { isEmptyMarkup } from '@hcengineering/text'
 import { generateToken } from '@hcengineering/server-token'
+import tracker, { Issue, Project } from '@hcengineering/tracker'
 
-import { ChannelRecord, MessageRecord, PlatformFileInfo, TelegramFileInfo } from './types'
+import { ChannelRecord, MessageRecord, PlatformFileInfo, RoutingTarget, TelegramFileInfo } from './types'
 
 export class WorkspaceClient {
   private constructor (
@@ -258,21 +259,79 @@ export class WorkspaceClient {
     return res
   }
 
-  async getChannelForActivityMessage (
-    messageId: Ref<ActivityMessage>
-  ): Promise<ChunterSpace | undefined> {
+  /**
+   * Resolves an activity message to a forum-topic routing target. Supports two
+   * sources currently:
+   *  - chunter (chat) → topic per channel/DM, the message lands in the topic and
+   *    inbound replies become chat messages in Huly
+   *  - tracker (issues) → topic per Project; topic is read-only since a top-level
+   *    Telegram post has no Issue context to attach to
+   * Returns undefined for unknown sources so the caller can fall back to DM.
+   */
+  async getRoutingTarget (
+    messageId: Ref<ActivityMessage>,
+    account: AccountUuid
+  ): Promise<RoutingTarget | undefined> {
     const message = await this.client.findOne(activity.class.ActivityMessage, { _id: messageId })
     if (message === undefined) return undefined
 
-    let channelId: Ref<ChunterSpace>
+    let attachedTo: Ref<Doc>
+    let attachedToClass: Ref<Class<Doc>>
+
     if (this.hierarchy.isDerived(message._class, chunter.class.ThreadMessage)) {
       const thread = message as ThreadMessage
-      channelId = thread.objectId as Ref<ChunterSpace>
+      attachedTo = thread.objectId
+      attachedToClass = thread.objectClass
     } else {
-      channelId = message.attachedTo as Ref<ChunterSpace>
+      attachedTo = message.attachedTo
+      attachedToClass = message.attachedToClass
     }
 
-    return await this.client.findOne(chunter.class.ChunterSpace, { _id: channelId })
+    if (this.hierarchy.isDerived(attachedToClass, chunter.class.ChunterSpace)) {
+      const space = await this.client.findOne(chunter.class.ChunterSpace, {
+        _id: attachedTo as Ref<ChunterSpace>
+      })
+      if (space === undefined) return undefined
+      return {
+        spaceRef: space._id as Ref<Space>,
+        spaceName: await this.formatChunterName(space, account),
+        kind: 'chunter'
+      }
+    }
+
+    if (this.hierarchy.isDerived(attachedToClass, tracker.class.Issue)) {
+      const issue = await this.client.findOne(tracker.class.Issue, {
+        _id: attachedTo as Ref<Issue>
+      })
+      if (issue === undefined) return undefined
+      const project = await this.client.findOne(tracker.class.Project, {
+        _id: issue.space
+      })
+      if (project === undefined) return undefined
+      const raw = project.name?.trim() ?? project.identifier?.trim() ?? 'Tracker'
+      const trimmed = raw.length > 120 ? raw.slice(0, 117) + '...' : raw
+      return {
+        spaceRef: project._id as Ref<Space>,
+        spaceName: `📋 ${trimmed}`,
+        kind: 'tracker'
+      }
+    }
+
+    return undefined
+  }
+
+  async formatChunterName (space: ChunterSpace, account: AccountUuid): Promise<string> {
+    if (this.hierarchy.isDerived(space._class, chunter.class.DirectMessage)) {
+      const persons = await this.getPersons(space.members.filter((it) => it !== account))
+      return persons
+        .map(({ name }) => formatName(name))
+        .sort((a, b) => a.localeCompare(b))
+        .join(', ')
+    }
+    if (this.hierarchy.isDerived(space._class, chunter.class.Channel)) {
+      return `#${space.name}`
+    }
+    return space.name
   }
 
   async findChunterSpace (channelRef: Ref<ChunterSpace>): Promise<ChunterSpace | undefined> {

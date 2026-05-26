@@ -75,6 +75,7 @@
     "@hcengineering/setting": "workspace:^0.7.423",
     "@hcengineering/telegram": "workspace:^0.7.423",
     "@hcengineering/telegram-assets": "workspace:^0.7.423",
+    "@hcengineering/tracker": "workspace:^0.7.423",
     "@hcengineering/text": "workspace:^0.7.423",
     "@hcengineering/api-client": "workspace:^0.7.423",
     "@telegraf/entity": "^0.5.0",
