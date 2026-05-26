@@ -1,0 +1,80 @@
+name: telegram-bot fork build
+
+on:
+  push:
+    tags:
+      - 'tg-*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Docker tag suffix (e.g. forum-topics-1)'
+        required: true
+        default: 'manual'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Cache rush
+        uses: actions/cache@v4
+        with:
+          path: |
+            common/temp/pnpm-store
+            common/temp/build-cache
+          key: rush-${{ runner.os }}-${{ hashFiles('common/config/rush/pnpm-lock.yaml') }}
+          restore-keys: |
+            rush-${{ runner.os }}-
+
+      - name: Rush install
+        run: node common/scripts/install-run-rush.js install
+
+      - name: Rush build telegram-bot
+        run: node common/scripts/install-run-rush.js build --to @hcengineering/pod-telegram-bot
+
+      - name: Rush bundle telegram-bot
+        run: node common/scripts/install-run-rush.js bundle --to @hcengineering/pod-telegram-bot
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute version
+        id: version
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=manual-${{ github.run_number }}-${{ inputs.tag }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build & push image
+        working-directory: services/telegram-bot/pod-telegram-bot
+        env:
+          DOCKER_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          ../../../common/scripts/docker_build.sh ghcr.io/${{ github.repository_owner }}/telegram-bot
+          docker push --all-tags ghcr.io/${{ github.repository_owner }}/telegram-bot
+
+      - name: Summary
+        run: |
+          echo "### Built image" >> $GITHUB_STEP_SUMMARY
+          echo "- \`ghcr.io/${{ github.repository_owner }}/telegram-bot:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`ghcr.io/${{ github.repository_owner }}/telegram-bot:${{ steps.version.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
