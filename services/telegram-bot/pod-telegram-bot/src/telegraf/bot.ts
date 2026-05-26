@@ -291,10 +291,13 @@ export async function setUpBot (worker: PlatformWorker): Promise<Telegraf<TgCont
       }
     }
 
+    // In supergroups chatId is the group id, but the integration is keyed by user
+    // telegram id. Pass fromId so onReply can locate the right user; fall back to
+    // chatId for DM where the two are equal.
     const replyTo = message.reply_to_message
     const isReplied = await onReply(
       ctx,
-      chatId,
+      fromId ?? chatId,
       message as ReplyMessage,
       message.message_id,
       replyTo.message_id,
